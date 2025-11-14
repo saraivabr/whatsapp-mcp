@@ -1,0 +1,41 @@
+# Git
+.git
+.gitignore
+.github
+
+# Build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+whatsapp-bridge
+
+# Test files
+*_test.go
+*.test
+*.out
+
+# Database files (will be in volumes)
+store/
+*.db
+*.db-shm
+*.db-wal
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Documentation
+README.md
+*.md
+
+# Misc
+.DS_Store
+.env
+.env.local
+tmp/
+temp/
