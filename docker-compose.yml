@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  # WhatsApp Bridge (Go)
+  whatsapp-bridge:
+    build:
+      context: ./whatsapp-bridge
+      dockerfile: Dockerfile
+    container_name: whatsapp-bridge
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./whatsapp-bridge/store:/app/store
+    environment:
+      - CGO_ENABLED=1
+    restart: unless-stopped
+    networks:
+      - whatsapp-network
+
+  # Backend Web Server (Python FastAPI)
+  backend:
+    build:
+      context: ./whatsapp-web-backend
+      dockerfile: Dockerfile
+    container_name: whatsapp-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - WHATSAPP_BRIDGE_URL=http://whatsapp-bridge:8080
+      - WHATSAPP_BRIDGE_WS_URL=ws://whatsapp-bridge:8080
+    depends_on:
+      - whatsapp-bridge
+    restart: unless-stopped
+    networks:
+      - whatsapp-network
+
+  # Frontend (Next.js)
+  frontend:
+    build:
+      context: ./whatsapp-web-ui
+      dockerfile: Dockerfile
+    container_name: whatsapp-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - whatsapp-network
+
+networks:
+  whatsapp-network:
+    driver: bridge
+
+volumes:
+  whatsapp-data:
