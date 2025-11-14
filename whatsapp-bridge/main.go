@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -14,11 +15,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/gorilla/websocket"
 	"github.com/mdp/qrterminal"
+	qrcode "github.com/skip2/go-qrcode"
 
 	"bytes"
 
@@ -40,6 +44,30 @@ type Message struct {
 	MediaType string
 	Filename  string
 }
+
+// ConnectionStatus represents the current WhatsApp connection status
+type ConnectionStatus struct {
+	Status    string `json:"status"` // "disconnected", "qr_ready", "connecting", "connected"
+	QRCode    string `json:"qr_code,omitempty"`
+	Message   string `json:"message,omitempty"`
+	Timestamp int64  `json:"timestamp"`
+}
+
+// Global state for connection status and QR code
+var (
+	connectionState = &ConnectionStatus{
+		Status:    "disconnected",
+		Timestamp: time.Now().Unix(),
+	}
+	connectionMutex sync.RWMutex
+	wsClients       = make(map[*websocket.Conn]bool)
+	wsClientsMutex  sync.RWMutex
+	wsUpgrader      = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Allow all origins for development
+		},
+	}
+)
 
 // Database handler for storing message history
 type MessageStore struct {
@@ -675,6 +703,50 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// Update connection status and notify WebSocket clients
+func updateConnectionStatus(status, message, qrCode string) {
+	connectionMutex.Lock()
+	connectionState.Status = status
+	connectionState.Message = message
+	connectionState.QRCode = qrCode
+	connectionState.Timestamp = time.Now().Unix()
+	connectionMutex.Unlock()
+
+	// Notify all connected WebSocket clients
+	notifyWebSocketClients()
+}
+
+// Notify all WebSocket clients of the current connection status
+func notifyWebSocketClients() {
+	connectionMutex.RLock()
+	statusJSON, _ := json.Marshal(connectionState)
+	connectionMutex.RUnlock()
+
+	wsClientsMutex.Lock()
+	defer wsClientsMutex.Unlock()
+
+	for client := range wsClients {
+		err := client.WriteMessage(websocket.TextMessage, statusJSON)
+		if err != nil {
+			client.Close()
+			delete(wsClients, client)
+		}
+	}
+}
+
+// Generate QR code as base64 PNG image
+func generateQRCodeBase64(text string) (string, error) {
+	// Generate QR code as PNG
+	png, err := qrcode.Encode(text, qrcode.Medium, 256)
+	if err != nil {
+		return "", err
+	}
+
+	// Convert to base64
+	base64Str := base64.StdEncoding.EncodeToString(png)
+	return "data:image/png;base64," + base64Str, nil
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	// Handler for sending messages
@@ -774,6 +846,94 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for getting QR code
+	http.HandleFunc("/api/qrcode", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow GET requests
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		connectionMutex.RLock()
+		status := connectionState.Status
+		qrCode := connectionState.QRCode
+		message := connectionState.Message
+		connectionMutex.RUnlock()
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if status == "qr_ready" && qrCode != "" {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"status":  status,
+				"qr_code": qrCode,
+				"message": message,
+			})
+		} else {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"status":  status,
+				"message": "QR code not available. Status: " + status,
+			})
+		}
+	})
+
+	// Handler for getting connection status
+	http.HandleFunc("/api/connection-status", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow GET requests
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		connectionMutex.RLock()
+		statusCopy := *connectionState
+		connectionMutex.RUnlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(statusCopy)
+	})
+
+	// WebSocket handler for real-time status updates
+	http.HandleFunc("/ws/status", func(w http.ResponseWriter, r *http.Request) {
+		// Upgrade HTTP connection to WebSocket
+		conn, err := wsUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			fmt.Printf("WebSocket upgrade error: %v\n", err)
+			return
+		}
+
+		// Register new client
+		wsClientsMutex.Lock()
+		wsClients[conn] = true
+		wsClientsMutex.Unlock()
+
+		fmt.Printf("New WebSocket client connected. Total clients: %d\n", len(wsClients))
+
+		// Send current status immediately
+		connectionMutex.RLock()
+		statusJSON, _ := json.Marshal(connectionState)
+		connectionMutex.RUnlock()
+		conn.WriteMessage(websocket.TextMessage, statusJSON)
+
+		// Keep connection alive and handle disconnection
+		defer func() {
+			wsClientsMutex.Lock()
+			delete(wsClients, conn)
+			wsClientsMutex.Unlock()
+			conn.Close()
+			fmt.Printf("WebSocket client disconnected. Total clients: %d\n", len(wsClients))
+		}()
+
+		// Read messages (mainly to detect disconnection)
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				break
+			}
+		}
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -847,9 +1007,11 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			updateConnectionStatus("connected", "Successfully connected to WhatsApp", "")
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+			updateConnectionStatus("disconnected", "Logged out from WhatsApp", "")
 		}
 	})
 
@@ -859,10 +1021,13 @@ func main() {
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
 		// No ID stored, this is a new client, need to pair with phone
+		updateConnectionStatus("connecting", "Waiting for QR code...", "")
+
 		qrChan, _ := client.GetQRChannel(context.Background())
 		err = client.Connect()
 		if err != nil {
 			logger.Errorf("Failed to connect: %v", err)
+			updateConnectionStatus("disconnected", fmt.Sprintf("Failed to connect: %v", err), "")
 			return
 		}
 
@@ -871,7 +1036,18 @@ func main() {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+
+				// Generate base64 QR code for web interface
+				qrBase64, err := generateQRCodeBase64(evt.Code)
+				if err != nil {
+					logger.Warnf("Failed to generate base64 QR code: %v", err)
+					updateConnectionStatus("qr_ready", "QR code ready (terminal only)", "")
+				} else {
+					updateConnectionStatus("qr_ready", "Scan QR code to authenticate", qrBase64)
+					fmt.Println("\nQR code is also available via API at http://localhost:8080/api/qrcode")
+				}
 			} else if evt.Event == "success" {
+				updateConnectionStatus("connecting", "QR code scanned, connecting...", "")
 				connected <- true
 				break
 			}
@@ -881,17 +1057,23 @@ func main() {
 		select {
 		case <-connected:
 			fmt.Println("\nSuccessfully connected and authenticated!")
+			updateConnectionStatus("connected", "Successfully connected to WhatsApp", "")
 		case <-time.After(3 * time.Minute):
 			logger.Errorf("Timeout waiting for QR code scan")
+			updateConnectionStatus("disconnected", "Timeout waiting for QR code scan", "")
 			return
 		}
 	} else {
 		// Already logged in, just connect
+		updateConnectionStatus("connecting", "Connecting with existing session...", "")
+
 		err = client.Connect()
 		if err != nil {
 			logger.Errorf("Failed to connect: %v", err)
+			updateConnectionStatus("disconnected", fmt.Sprintf("Failed to connect: %v", err), "")
 			return
 		}
+		updateConnectionStatus("connected", "Successfully connected to WhatsApp", "")
 		connected <- true
 	}
 
